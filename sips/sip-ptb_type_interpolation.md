@@ -13,7 +13,7 @@
 
 ## Abstract
 
-Extend PTBs to allow type arguments to reference `Result` values from prior commands. Currently type arguments must be string literals, preventing "publish-and-use" in a single transaction.
+PTB type args only accept string literals. If you publish a package, you don't know the package ID until the tx lands — so you can't use your new types as generics in the same transaction. This adds a `FromResult` variant to the type argument encoding and `typeFromResult()` to the SDK. No Move or VM changes — the executor already resolves Result references for objects, this extends that to type args.
 
 ## Motivation
 
