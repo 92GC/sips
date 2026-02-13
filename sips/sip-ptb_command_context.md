@@ -1,7 +1,7 @@
 |   SIP-Number | |
 |         ---: | :--- |
-|        Title | PTB Command Context & Scoped Execution |
-|  Description | Expose PTB command metadata and argument provenance to Move; add scoped execution for isolation |
+|        Title | PTB Dynamic Dispatch via Command Context & Scoped Execution |
+|  Description | Enable dynamic dispatch in PTBs by exposing command metadata and argument origins to Move; add scoped execution for isolation |
 |       Author | Greshamscode, @92GC |
 |       Editor | |
 |         Type | Standard |
@@ -12,17 +12,19 @@
 
 ## Abstract
 
-Four additions to PTBs:
-1. **Command Context** — Any command in a scope can read metadata (package, module, function) of every other command in that scope.
-2. **Argument Provenance** — Track which command produced each argument, enabling origin verification.
-3. **Scoped Execution** — Partition PTB commands into isolated groups that share internal context but hide it from the outside.
-4. **Scope Witness** — Proof that two commands executed in the same scope.
+This SIP enables dynamic dispatch in PTBs. Today, composing protocols requires pre-built hot potato wrappers for every integration — new protocol means new wrapper code. We propose letting contracts inspect which commands are in their PTB scope and where argument values came from, so they can verify callers and value origins at runtime. No wrappers needed.
+
+Concretely, four additions:
+1. Expose command metadata (package, module, function) to all commands within a scope
+2. Track which command produced each argument passed to a function
+3. A new `Scope` command that partitions PTB commands into isolated groups
+4. A witness proving two commands share a scope
 
 ## Motivation
 
-Composing Move protocols today requires hot potato wrappers for every integration. A DAO executing "vault spend → DEX swap → vault deposit" needs a custom wrapper action for each DEX. New DEX = new wrapper code.
+A DAO wants to execute "vault spend → DEX swap → vault deposit." Today this requires a wrapper action per DEX that type-checks the coin flow at compile time. Adding a new DEX means writing and deploying new wrapper code.
 
-With command context + argument provenance, the deposit function can verify at runtime that the coin it received came from an approved package — no wrapper needed:
+With this proposal, the deposit function verifies at runtime that the coin came from an approved package:
 
 ```move
 public fun deposit_from_approved<CoinType>(ctx: &TxContext, coin: Coin<CoinType>) {
@@ -33,11 +35,15 @@ public fun deposit_from_approved<CoinType>(ctx: &TxContext, coin: Coin<CoinType>
 }
 ```
 
-Scopes solve the flipside: without them, a protocol could inspect context and refuse execution when it sees a competitor in the same PTB. Scopes partition commands so each group only sees its own context, preventing censorship while keeping the transaction atomic.
+Adding a new DEX becomes an allowlist update, not new code.
+
+Scopes solve the flipside: without isolation, a protocol could inspect context and refuse execution when it sees a competitor. Scopes partition commands so each group only sees its own context, preventing censorship while keeping the transaction atomic.
 
 ## Specification
 
 ### 1. Command Context
+
+A new `sui::ptb_context` module exposes metadata about commands in the current scope.
 
 ```move
 module sui::ptb_context {
@@ -78,6 +84,8 @@ module sui::ptb_context {
 All commands within a scope can see all other commands in that scope. Visibility does not cross scope boundaries unless `inherit_context` is set.
 
 ### 2. Argument Provenance
+
+Extends `sui::ptb_context` with argument origin tracking.
 
 ```move
 module sui::ptb_context {
@@ -149,9 +157,9 @@ module sui::ptb_context {
 
 ## Rationale
 
-**Full scope visibility (not past-only):** Restricting to past commands would still allow ordering games. Full visibility within a scope is simpler and lets contracts verify the complete execution context they're part of. Scopes are the isolation boundary, not command ordering.
+**Full scope visibility (not past-only):** Restricting to past commands would still allow ordering games. Full visibility within a scope is simpler and lets contracts verify the complete execution context. Scopes are the isolation boundary, not command ordering.
 
-**Scopes, not `is_scoped()`:** Exposing whether a call is scoped would let protocols refuse non-scoped calls, defeating the purpose. `scope_depth()` returns 1 for both top-level and explicit scopes — indistinguishable.
+**Scopes, not `is_scoped()`:** Exposing whether a call is scoped lets protocols refuse non-scoped calls, defeating the purpose. `scope_depth()` returns 1 for both top-level and explicit scopes — indistinguishable.
 
 **No parameter exposure:** Too expensive (arbitrary BCS), type-unsafe, and argument provenance covers the important cases.
 
