@@ -8,10 +8,9 @@ Add one native function on `sui::tx_context`:
 public fun current_command_range_hash(ctx: &TxContext, additional_commands: u64): vector<u8>
 ```
 
-This returns a versioned hash of the current PTB command and the next
-`additional_commands` commands.
+This returns a versioned hash of a given sequential range of the current PTB commands.
 
-The point is simple: let a contract lock in the part of a PTB it cares about,
+This let's a contract lock in the part of a PTB it cares about,
 while leaving the rest of the PTB open for wallets, solvers, sponsors, or other
 composition.
 
