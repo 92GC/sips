@@ -1,201 +1,267 @@
-|   SIP-Number | |
-|         ---: | :--- |
-|        Title | PTB Dynamic Dispatch via Command Context & Scoped Execution |
-|  Description | Enable dynamic dispatch in PTBs by exposing command metadata and argument origins to Move; add scoped execution for isolation |
-|       Author | Greshamscode, @92GC |
-|       Editor | |
-|         Type | Standard |
-|     Category | Framework |
-|      Created | 2025-02-04 |
-| Comments-URI | |
-|       Status | |
+# SIP-70: Current Command Range Hash
 
-## Abstract
+## Summary
 
-This SIP enables dynamic dispatch in PTBs. Today, composing protocols requires pre-built hot potato wrappers for every integration — new protocol means new wrapper code. We propose letting contracts inspect which commands are in their PTB scope and where argument values came from, so they can verify callers and value origins at runtime. No wrappers needed.
+Add one native function on `sui::tx_context`:
 
-Concretely, four additions:
-1. Expose command metadata (package, module, function) to all commands within a scope
-2. Track which command produced each argument passed to a function
-3. A new `Scope` command that partitions PTB commands into isolated groups
-4. A witness proving two commands share a scope
+```move
+public fun current_command_range_hash(ctx: &TxContext, additional_commands: u64): vector<u8>
+```
+
+This returns a versioned hash of the current PTB command and the next
+`additional_commands` commands.
+
+The point is simple: let a contract lock in the part of a PTB it cares about,
+while leaving the rest of the PTB open for wallets, solvers, sponsors, or other
+composition.
+
+This is more useful than a whole-PTB hash for smart accounts and governance,
+because the authorized intent can be fixed without forcing the whole transaction
+to be fixed.
 
 ## Motivation
 
-A DAO wants to execute "vault spend → DEX swap → vault deposit." Today this requires a wrapper action per DEX that type-checks the coin flow at compile time. Adding a new DEX means writing and deploying new wrapper code.
+Apps currently need execution wrappers for every new function they want to call.
+This is messy UX and prevents JIT execution.
 
-With this proposal, the deposit function verifies at runtime that the coin came from an approved package:
+This lets smart accounts, DAOs, and account-abstraction systems act as wallets
+and interact seamlessly without hard-coded pre-deployed wrappers.
 
-```move
-public fun deposit_from_approved<CoinType>(ctx: &TxContext, coin: Coin<CoinType>) {
-    let source = ptb_context::argument_source(ctx, 0);
-    assert!(source.is_some(), ENotFromPTBResult);
-    let cmd = ptb_context::command_at(ctx, source.borrow().command_index());
-    assert!(is_approved(cmd.package_id), EUnauthorizedSource);
-}
-```
+`current_command_range_hash(ctx, additional_commands)` keeps the primitive at
+the PTB layer:
 
-Adding a new DEX becomes an allowlist update, not new code.
+- fixed intent commands can be committed to
+- solver/wallet commands before or after the range can stay open
+- Move receives only an opaque hash
+- no PTB introspection is exposed
 
-Scopes solve the flipside: without isolation, a protocol could inspect context and refuse execution when it sees a competitor. Scopes partition commands so each group only sees its own context, preventing censorship while keeping the transaction atomic.
+This is idiomatic because it makes fixed intents and open solver execution
+composable without leaking PTB abstractions into Move.
 
 ## Specification
 
-### 1. Command Context
-
-A new `sui::ptb_context` module exposes metadata about commands in the current scope.
+### Move API
 
 ```move
-module sui::ptb_context {
-    public enum CommandType has copy, drop {
-        MoveCall,
-        TransferObjects,
-        SplitCoins,
-        MergeCoins,
-        Publish,
-        MakeMoveVec,
-        Upgrade,
-        Scope,
-    }
-
-    public struct CommandInfo has copy, drop {
-        index: u16,
-        command_type: CommandType,
-        package_id: address,    // MoveCall/Upgrade only, @0x0 otherwise
-        module_name: String,    // MoveCall only
-        function_name: String,  // MoveCall only
-    }
-
-    /// Current command's index in its scope
-    public native fun current_index(ctx: &TxContext): u16;
-
-    /// Total commands in current scope
-    public native fun total_commands(ctx: &TxContext): u16;
-
-    /// Get info for any command in the current scope
-    public native fun command_at(ctx: &TxContext, index: u16): Option<CommandInfo>;
-
-    /// Scope nesting depth. Top-level PTB and explicit scope both return 1
-    /// (indistinguishable by design — prevents contracts from detecting scope usage)
-    public native fun scope_depth(ctx: &TxContext): u8;
+module sui::tx_context {
+    /// Returns a hash of the current command and the next `additional_commands`
+    /// commands.
+    /// Output: [version_byte | blake2b256_hash] (33 bytes).
+    public fun current_command_range_hash(
+        _self: &TxContext,
+        additional_commands: u64,
+    ): vector<u8>;
 }
 ```
 
-All commands within a scope can see all other commands in that scope. Visibility does not cross scope boundaries unless `inherit_context` is set.
+The current command is the PTB command that is currently executing this native.
+For example, if command 4 calls a smart account function that calls
+`current_command_range_hash(ctx, 2)`, the hash covers commands 4, 5, and 6.
 
-### 2. Argument Provenance
+The current command is included in the hash.
 
-Extends `sui::ptb_context` with argument origin tracking.
+`additional_commands = 0` hashes the current command only.
+
+Because the current command is included, the expected hash should come from
+authenticated object state, such as an approved account or DAO intent. It should
+not be passed as a pure argument to the command being hashed.
+
+### Output Format
+
+```text
+[version_byte | blake2b256_hash]
+```
+
+- version `0x01` = current command range hash scheme
+- total output: 33 bytes
+
+If fewer than `additional_commands` commands remain after the current command,
+the function returns a domain-separated unavailable hash, not an abort. The
+unavailable hash must not collide with any valid command range hash. Callers
+should treat it as a normal hash comparison failure.
+
+This lets contracts safely write:
 
 ```move
-module sui::ptb_context {
-    public enum ArgumentSource has copy, drop {
-        Input { input_index: u16 },
-        Result { command_index: u16, result_index: u16 },
-        NestedResult { command_index: u16, result_index: u16 },
-    }
-
-    /// Source of the argument at the given index (excluding implicit &TxContext)
-    public native fun argument_source(ctx: &TxContext, arg_index: u8): Option<ArgumentSource>;
-
-    /// Check if argument came from a specific command
-    public fun argument_is_from_command(ctx: &TxContext, arg_index: u8, command_index: u16): bool {
-        let source = argument_source(ctx, arg_index);
-        if (source.is_none()) return false;
-        match (*source.borrow()) {
-            ArgumentSource::Result { command_index: idx, .. } => idx == command_index,
-            ArgumentSource::NestedResult { command_index: idx, .. } => idx == command_index,
-            _ => false,
-        }
-    }
-}
+let actual = tx_context::current_command_range_hash(ctx, additional_commands);
+assert!(
+    actual == expected_hash,
+    EHashMismatch,
+);
 ```
 
-### 3. Scoped Execution
+without also needing to introspect PTB length.
 
-New PTB command variant:
+### What Is Hashed
 
-```rust
-enum Command {
-    // ... existing variants ...
-    Scope {
-        commands: Vec<Command>,
-        inherit_context: bool,
-    },
-}
+The hash commits to the selected contiguous command range only.
+
+For every command in the range, the encoder commits to:
+
+- command kind
+- package, module, function, and type arguments for Move calls
+- command-specific data for non-Move-call commands
+- argument count and argument structure
+- result flow between commands inside the range
+- imported values from outside the range, as imports
+
+All strings, byte blobs, and lists are length-framed. That means the hash input
+includes each field's length before the field bytes, so two different command
+encodings cannot collide by concatenating to the same byte string.
+
+### What Is Not Hashed
+
+The hash does not commit to:
+
+- sender/caller address
+- sponsor address
+- signatures
+- transaction digest
+- gas budget
+- gas price
+- gas coin object ID
+- gas coin version
+- object versions
+- commands before the selected range
+- commands after the selected range
+- absolute command position
+
+The VM may use the current command index internally to compute the range, but
+the API exposes only the hash. It does not expose position, depth, frame kind, or
+whether the caller is inside any higher-level application abstraction.
+
+### Argument Normalization
+
+Each PTB argument is normalized before hashing:
+
+| Argument Type | What Gets Hashed | Rationale |
+| --- | --- | --- |
+| `GasCoin` | marker only | gas coin identity is sender-dependent and should not be part of intent |
+| `Pure(bytes)` | exact bytes | fixed parameter value |
+| `SharedObject` | ObjectID + mutability mode | mutability changes lock/call semantics, so it is hashed; object versions are not stable |
+| `ImmOrOwnedObject` | ObjectID | version can drift between authorization and execution |
+| `Receiving` | ObjectID | version can drift |
+| result inside range | relative command/result index | commits to flow inside the locked range |
+| result before range | import slot | allows solver/wallet setup before the locked range |
+
+Direct PTB inputs are fixed. If a command in the range uses a direct object or
+pure input, that value is part of the hash.
+
+If a command in the range uses a value produced by a command before the range,
+that value is encoded as an import. The hash commits that an imported value is
+used, and where it is used, but not to the full command sequence that produced
+it.
+
+Import slots are assigned by first use inside the range. Reusing the same
+external value reuses the same import slot. Different external values get
+different import slots.
+
+This is the key composability property: a solver can do any number of setup
+commands first, then route values into the fixed range, without changing the
+range hash.
+
+### Hash Construction
+
+Conceptually:
+
+```text
+range_hash = 0x01 || Blake2b256(
+    "SUI_CURRENT_COMMAND_RANGE_HASH"
+    || additional_commands
+    || for each selected command in order:
+        Blake2b256(
+            command_kind
+            || length_framed(command_specific_data)
+            || normalized_arguments
+        )
+)
 ```
 
-- `current_index()` resets to 0 inside a scope
-- `command_at()` returns only scope-internal commands (unless `inherit_context: true`)
-- Argument provenance indices are scope-relative
-- Results flow out via normal `Result(scope_idx)` references
-- Scopes nest; `scope_depth` increments accordingly
+The concrete encoder should be semantic and versioned, not raw BCS of the PTB
+Rust type. Future PTB shape changes can then be handled by the encoder instead
+of changing the Move API.
 
-SDK usage:
-```typescript
-ptb.scope({ inheritContext: false }, (scope) => {
-    const pub = scope.publish({ modules, deps });
-    scope.moveCall({ target: `...`, typeArguments: [scope.typeFromResult(pub, "mod", "Type")] });
-});
+### Example
+
+The wallet or solver can build:
+
+```text
+0. solver setup command
+1. solver setup command
+2. smart_account::execute_intent(account, intent_id, 2, ctx)
+3. fixed intent command
+4. fixed intent command
+5. solver settlement command
 ```
 
-### 4. Scope Witness
+Inside command 2, the smart account checks:
 
 ```move
-module sui::ptb_context {
-    public struct ScopeWitness has drop {
-        scope_id: u256,
-        creator_index: u16,
-        scope_depth: u8,
-    }
-
-    public native fun create_scope_witness(ctx: &mut TxContext): ScopeWitness;
-    public native fun in_same_scope(ctx: &TxContext, witness: &ScopeWitness): bool;
-    public native fun current_scope_id(ctx: &TxContext): u256;
-}
+let expected_hash = smart_account::approved_hash(account, intent_id);
+let actual = tx_context::current_command_range_hash(ctx, 2);
+assert!(actual == expected_hash, EHashMismatch);
 ```
 
-## Rationale
+The hash covers commands 2, 3, and 4.
 
-**Full scope visibility (not past-only):** Restricting to past commands would still allow ordering games. Full visibility within a scope is simpler and lets contracts verify the complete execution context. Scopes are the isolation boundary, not command ordering.
+Commands 0, 1, and 5 are not hashed. The solver can change them without
+changing the authorized intent, as long as the locked range still receives the
+right imported values and has the same command structure.
 
-**Scopes, not `is_scoped()`:** Exposing whether a call is scoped lets protocols refuse non-scoped calls, defeating the purpose. `scope_depth()` returns 1 for both top-level and explicit scopes — indistinguishable.
+The expected hash is loaded from the smart account's approved intent state. It
+is not a caller-supplied pure argument, so the hash does not require a fixed
+point.
 
-**No parameter exposure:** Too expensive (arbitrary BCS), type-unsafe, and argument provenance covers the important cases.
+## Why Not Full PTB Hash
 
-**Exposure vs hiding is intentional:** Context lets governance protocols verify callers. Scopes let DeFi protocols stay composable. The user picks the boundary per call.
+A full PTB hash is too rigid for the main use case.
 
-## Backwards Compatibility
+Smart accounts and governance usually want to authorize the important part of a
+transaction, not the exact gas setup, solver route, sponsorship details, or
+settlement tail.
 
-Purely additive. Existing PTBs work unchanged. `ptb_context` functions return sensible defaults pre-feature. `argument_source` returns `None` for pre-feature commands.
+A range hash lets the authorized part stay fixed while solver, wallet, and
+sponsorship logic stays flexible.
+
+## Implementation Notes
+
+This can be implemented with the same broad machinery as a structural digest,
+but scoped to the current command range:
+
+1. Store or expose the current `ProgrammableTransaction` to `TxContext` during
+   execution.
+2. Track the currently executing command index internally in the PTB executor.
+3. When the native is called, hash the inclusive range
+   `[current_index, current_index + additional_commands]`.
+4. Encode in-range result references relatively.
+5. Encode references to earlier results as imports.
+6. Return the unavailable hash if the requested range runs past the end.
+7. Charge base gas plus a per-byte/per-command cost for the hashed range.
+
+The current command index is execution metadata. It is not returned to Move and
+is not part of the public API.
 
 ## Security Considerations
 
-- Read-only — commands can inspect context but not modify it
-- All commands in a scope see each other; scopes are the privacy boundary
-- Package IDs are Original IDs (immutable, not upgraded addresses)
-- Provenance is VM-tracked and unforgeable
-- Scope witnesses are VM-generated — cannot be spoofed
-- Max scope depth limit prevents gas exhaustion via deep nesting
-- Contracts should validate values, not just their provenance
+- VM-computed and read-only
+- order-sensitive within the selected range
+- flow-sensitive within the selected range
+- no sender/caller address or gas coin identity in the hash
+- no PTB introspection
+- no way to ask for absolute PTB position
+- commands outside the range remain intentionally open
 
-## Open Questions
+Contracts should compare the returned hash against an expected hash that was
+computed off-chain using the same versioned encoder.
 
-1. Max scope depth? (suggest 64)
-2. Should scopes have independent gas budgets?
-3. Can outer PTB reference inner scope Results by index?
-4. Does inner scope failure abort the entire PTB? (suggest yes)
-5. Should `typeFromResult` work across scope boundaries?
-6. Should `&TxContext` count as arg 0 or be excluded from indexing?
+## Backwards Compatibility
 
-## Test Cases
+Purely additive. This adds one new native function behind a protocol version.
 
-To be developed.
+The version byte lets future hash schemes coexist with existing stored hashes.
 
-## Reference Implementation
+## Future Work
 
-To be developed.
-
-## Copyright
-
-Copyright and related rights waived via [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
+- SDK support for off-chain range hash computation
+- test vectors for common smart-account and solver patterns
+- optional helper APIs in wallets for building PTBs around a locked range
