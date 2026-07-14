@@ -1,7 +1,7 @@
 |   SIP-Number | |
 |         ---: | :--- |
-|        Title | On-Chain Liveness Oracle |
-|  Description | Introduces a sui::checkpoint module that acts as a trustless liveness oracle, enabling on-chain circuit breakers. |
+|        Title | On-Chain Commit Liveness Counters |
+|  Description | Extends the system Clock with consensus-maintained commit-gap statistics and monotonic stall counters for trustless circuit breakers. |
 |       Author | Greshamscode, @92GC |
 |       Editor | <Leave this blank; it will be assigned by a SIP Editor> |
 |         Type | Standard |
@@ -13,87 +13,112 @@
 
 ## Abstract
 
-This proposal introduces a new, read-only system module, sui::checkpoint, that functions as a native liveness oracle. It exposes historical checkpoint data and a highly efficient function to get the largest time gap between consecutive checkpoints in a recent history window. This enables smart contracts to detect network stalls and act as trustless circuit breakers, removing the need for off-chain social consensus on network health.
+This proposal extends the system `Clock` with commit-gap statistics maintained automatically by the network. It exposes an exponential moving average (EMA) of normal commit intervals and monotonic counters for gaps that exceed the baseline by significant multiples.
+
+Contracts can snapshot a counter when an operation begins and compare it later. If the counter changed, the contract knows that a material network stall occurred during the operation, even if the network subsequently recovered.
 
 ## Motivation
 
-Currently, there is no way for a smart contract to programmatically determine if the Sui network has recently experienced significant downtime or a stall. This forces critical decisions about network health to rely on off-chain social consensus. This proposal introduces an on-chain, trustless liveness oracle. By providing a direct way to measure the largest time gap between recent checkpoints, it allows contracts to build in their own circuit breakers. TWAP functions should not be trusted if the chain has experienced significant down time. [Govex.ai](https://www.govex.ai/) a futarchy based DAO management platform on Sui would like to run it's TWAP over short time markets but does not want to risk a chain restart occuring during a short market, nor does it want to trust an admin with the power to invalidate markets.
+Contracts cannot currently determine whether Sui experienced a significant stall during a market, auction, oracle window, or governance process. This is particularly dangerous for short-window TWAPs: a market may appear to span two hours of wall-clock time while only being live for a small part of that interval.
+
+Checkpoint timestamps are not the correct primitive because checkpoint construction and execution are asynchronous. Consensus commit timestamps directly measure the intervals relevant to execution.
+
+Historical range queries, sliding-window maxima, and median calculations would require additional history, indexing, and crash-recovery machinery. A monotonic incident counter provides the circuit-breaker property directly with constant-size state.
 
 ## Specification
 
-This SIP introduces a new native module, sui::checkpoint, with the following public functions:move
-module sui::checkpoint {
+The system `Clock` is extended with read-only accessors equivalent to:
+
+```move
+module sui::clock {
+    /// Most recently observed interval between consecutive consensus commits.
+    public fun last_commit_gap_ms(clock: &Clock): u64;
+
+    /// Protocol-maintained EMA of normal commit intervals.
+    public fun commit_gap_ema_ms(clock: &Clock): u64;
+
+    /// Number of commit gaps that exceeded 10x the prior EMA baseline.
+    public fun stall_count_10x(clock: &Clock): u64;
+
+    /// Number of commit gaps that exceeded 100x the prior EMA baseline.
+    public fun stall_count_100x(clock: &Clock): u64;
+}
 ```
-module sui::checkpoint 
-    /// Returns the sequence number of the most recently finalized checkpoint.
-    public native fun last_finalized_sequence_number(): u64;
 
-    /// Returns the consensus timestamp in milliseconds for the checkpoint with the
-    /// given `sequence_number`.
-    /// Returns `Some(timestamp)` if the checkpoint is within the protocol-defined
-    /// accessible history window, and `None` otherwise.
-    public native fun get_timestamp_ms(sequence_number: u64): option::Option<u64>;
+The exact storage and native-function boundary is an implementation detail. The values must be consensus-maintained and identical for all validators.
 
-    /// Returns the sequence number of the oldest checkpoint available via `get_timestamp_ms`.
-    /// This allows contracts to discover the bounds of accessible history.
-    public native fun accessible_history_window_start(): u64;
+For each new consensus commit, the protocol:
 
-    /// Returns the largest time gap in milliseconds between any two consecutive
-    /// checkpoints within the defined history window. This serves as a direct
-    /// measure of recent network instability.
-    public native fun largest_checkpoint_gap_in_history_window(): u64;
+1. Calculates the gap from the preceding commit timestamp.
+2. Compares the gap with the EMA value from before the current observation.
+3. Increments the applicable stall counters.
+4. Updates the EMA with the new observation.
+5. Persists the resulting state in the system `Clock`.
 
-    /// Returns the largest time gap in milliseconds between any two consecutive
-    /// checkpoints `(Ck, Ck+1)` where `Ck.sequence_number >= start_sequence_number`
-    /// and `Ck+1.sequence_number <= last_finalized_sequence_number()`.
-    ///
-    /// - If `start_sequence_number` is less than `accessible_history_window_start()`,
-    ///   this function returns `None` as the requested start is too old.
-    /// - If `start_sequence_number` is greater than `last_finalized_sequence_number()`,
-    ///   this function returns `None` as the start is invalid (e.g. in the future).
-    /// - If `start_sequence_number` is equal to `last_finalized_sequence_number()`,
-    ///   no gaps can be formed, so it returns `Some(0)`.
-    /// - Otherwise, it iterates through the relevant checkpoints, calculates all
-    ///   gaps `(timestamp(i+1) - timestamp(i))` for `i` from `start_sequence_number`
-    ///   to `last_finalized_sequence_number() - 1`, and returns `Some(max_gap)`.
-    ///   If any `get_timestamp_ms` call within the valid range unexpectedly returns `None`
-    ///   (which shouldn't happen for finalized, accessible checkpoints), this function
-    ///   would propagate the `None` or handle it as an internal error (implementation detail,
-    ///   but `None` is safer for the caller).
-    public native fun largest_checkpoint_gap_since_sequence_number(start_sequence_number: u64): option::Option<u64>;
+The EMA coefficient, initialization rule, integer rounding, and a protocol-defined minimum absolute gap must be specified and versioned in protocol configuration. The absolute floor prevents ordinary startup variance or very small baselines from being classified as stalls.
 
+Counters are monotonic. A 100x incident also increments the 10x counter.
+
+## Example
+
+A market snapshots the counter when it opens:
+
+```move
+market.start_stall_count = clock::stall_count_100x(clock);
 ```
+
+At settlement:
+
+```move
+let stalled = clock::stall_count_100x(clock) != market.start_stall_count;
+if (stalled) {
+    // Apply the market's circuit-breaker policy.
+};
+```
+
+Because the counter is monotonic, the incident remains detectable after normal block production resumes.
 
 ## Rationale
 
-This functionality must be implemented as a native module within the Sui runtime. The Move VM's security model prohibits smart contracts from arbitrarily accessing the ledger's historical state.
+- **Commit timestamps:** Measure consensus execution intervals without checkpoint-construction delay.
+- **Clock extension:** Keeps liveness data in the existing system time primitive.
+- **EMA baseline:** Adapts to durable changes in normal network cadence.
+- **Pre-update comparison:** A large gap is recorded before it can influence the EMA, so smoothing cannot hide the incident.
+- **Monotonic counters:** Allow arbitrary overlapping markets to take independent snapshots without retaining per-market history in the protocol.
+- **Constant-size state:** Avoids historical scans, sliding deques, segment trees, and validator state bloat.
+- **No keeper:** The network updates the values automatically; contracts and bots only read them.
 
-The functions `get_timestamp_ms` and `last_finalized_sequence_number` are simple lookups into the node's existing checkpoint database.
+## Crash Recovery
 
-The `largest_checkpoint_gap_in_history_window` function, while seemingly complex, can be implemented with extreme efficiency at the native level using a "Sliding Window Maximum" algorithm. Instead of re-scanning millions of checkpoints, a validator maintains a specialized data structure (a double-ended queue) that tracks the largest gap. When a new checkpoint is added, only a few constant-time operations are needed to update this structure. Because older, smaller gaps can never become the maximum as the window slides forward, they are efficiently discarded from consideration. This ensures the largest gap is always pre-calculated and can be read instantly, making the function call fast and gas-efficient for smart contracts. The largest_checkpoint_gap_since_sequence_number(start_sequence_number: u64) function provides a more granular query. As it operates on a user-defined start point up to the present, it cannot rely on the same global pre-computation. Instead, it performs a linear scan over the requested checkpoint range [start_sequence_number, last_finalized_sequence_number()]. The computational cost is therefore proportional to the length of this range. Gas fees for this function will scale accordingly to prevent abuse."
+The previous commit timestamp, EMA, and counters are consensus state. After a validator or network restart, the first successful commit compares its timestamp with the last persisted commit timestamp. A restart-sized gap is therefore recorded automatically.
+
+No off-chain cranker, archival database, or reconstruction of a sliding history window is required.
 
 ## Backwards Compatibility
 
-This proposal is a purely additive and non-breaking change. It introduces a new, self-contained module and does not alter any existing modules, functions, or data structures. No existing smart contracts will be affected.
+This proposal is additive. Existing `Clock` behavior and public functions remain unchanged.
 
 ## Test Cases
 
-To be developed following initial review of the proposal.
+- Normal commit intervals update the EMA without incrementing counters.
+- A gap greater than 10x but less than 100x increments only the 10x counter.
+- A gap greater than 100x increments both counters.
+- The triggering gap is compared against the EMA before that gap is incorporated.
+- A restart-sized gap is recorded on the first subsequent commit.
+- Counter values remain monotonic across epochs and protocol upgrades.
+- EMA initialization and integer rounding are deterministic.
 
 ## Reference Implementation
 
-A reference implementation will be developed by core engineers if the SIP is approved.
+To be developed.
 
 ## Security Considerations
 
-1.  **Denial-of-Service (DoS) via Resource Exhaustion:** A malicious actor could repeatedly call `get_timestamp_ms` for old checkpoints, consuming excessive validator resources.
-    *   **Mitigation:** The gas cost for `get_timestamp_ms` must include a variable component that scales with the age of the requested checkpoint (`current_checkpoint - requested_checkpoint`), making deep historical queries economically infeasible for attackers.
-2.  **Validator State Bloat:** Requiring validators to store an infinite history of checkpoint metadata is unsustainable and would increase centralization pressure.
-    *   **Mitigation:** The protocol must define and enforce a fixed-size, sliding window for the on-chain accessible history (e.g., the last 2-4 million checkpoints). Data older than this window would be pruned and only accessible via off-chain archival solutions.
-3.  **Algorithmic Complexity of `largest_checkpoint_gap_in_history_window`:** A naive implementation of this function could be computationally expensive, creating a DoS vector.
-    *   **Mitigation:** The native implementation must use an efficient sliding window algorithm (e.g., using a deque) as described in the Rationale. This ensures the calculation is near-constant time and does not create a computational bottleneck for validators.
-4.  **Algorithmic Complexity of `largest_checkpoint_gap_since_sequence_number`:** This function performs a scan proportional to the number of checkpoints requested (N = last_finalized_sequence_number - start_sequence_number). A very large N could lead to high resource consumption.
-    *   **Mitigation:** Implementing `largest_checkpoint_gap_since_sequence_number`natively as a Segment Tree for O(log W)  complexity.
+- Only the protocol may update the liveness fields.
+- Commit timestamps must use the same consensus-defined monotonicity rules as the system clock.
+- Arithmetic must define overflow, saturation, and rounding behavior.
+- Changes to EMA or threshold parameters must be protocol-versioned.
+- The counters report that a timing anomaly occurred; individual applications remain responsible for choosing the appropriate response.
 
 ## Copyright
 
